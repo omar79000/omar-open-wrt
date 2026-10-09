@@ -95,7 +95,7 @@ jobs:
           PY
 
           sudo mksquashfs rootfs "$FW_DIR/root.new" \
-            -comp xz -b 262144 -noappend -all-root -no-xattrs
+            -comp xz -b 262144 -noappend -no-xattrs
 
           sudo mv "$FW_DIR/root.new" "$FW_DIR/root"
 
