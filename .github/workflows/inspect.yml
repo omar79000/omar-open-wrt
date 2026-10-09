@@ -1,0 +1,47 @@
+
+name: Inspect SIMAX1800T firmware
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download repository files
+        uses: actions/checkout@v4
+
+      - name: Install inspection tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y squashfs-tools file
+
+      - name: Inspect firmware
+        run: |
+          set -eu
+          IMG="$(find . -maxdepth 1 -type f -name '*.bin' -print -quit)"
+          if [ -z "$IMG" ]; then
+            echo "ERROR: No .bin firmware found in repository root"
+            exit 1
+          fi
+          echo "Firmware: $IMG"
+          ls -lh "$IMG"
+          file "$IMG"
+          echo "---- Archive contents ----"
+          tar -tf "$IMG" | head -80
+          mkdir -p inspect
+          tar -xf "$IMG" -C inspect
+          echo "---- Extracted components ----"
+          find inspect -maxdepth 2 -type f -exec ls -lh {} \;
+          echo "---- SquashFS information ----"
+          find inspect -type f -exec sh -c '
+            for f do
+              if unsquashfs -s "$f" >/dev/null 2>&1; then
+                echo "SQUASHFS: $f"
+                unsquashfs -s "$f"
+              fi
+            done
+          ' sh {} +
