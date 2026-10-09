@@ -1,0 +1,121 @@
+
+name: Build AL-YAHYAWI SIMAX1800T
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y squashfs-tools python3
+
+      - name: Extract original firmware
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMG="$(find . -maxdepth 1 -type f -name '*.bin' -print -quit)"
+          test -n "$IMG"
+          mkdir work
+          tar -xf "$IMG" -C work
+          DIR="work/sysupgrade-sim_simax1800t"
+          test -f "$DIR/CONTROL"
+          test -f "$DIR/kernel"
+          test -f "$DIR/root"
+          echo "FW_DIR=$DIR" >> "$GITHUB_ENV"
+
+      - name: Extract and customize root filesystem
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo unsquashfs -d rootfs "$FW_DIR/root"
+
+          sudo tee rootfs/etc/banner >/dev/null <<'EOF'
+          =======================================================
+            اليحيوي للتجارة ومستلزمات الشبكات
+            AL-YAHYAWI-OPENWRT
+          =======================================================
+          EOF
+
+          sudo tee rootfs/etc/uci-defaults/99-vikoomlink-dumb-ap >/dev/null <<'EOF'
+          # AL-YAHYAWI SIMAX1800T defaults
+          uci set system.@system[0].hostname='AL-YAHYAWI-OPENWRT'
+          uci set system.@system[0].description='اليحيوي للتجارة ومستلزمات الشبكات'
+
+          uci set wireless.radio0.disabled='0'
+          uci set wireless.radio0.channel='11'
+          uci set wireless.radio0.country='PA'
+          uci set wireless.radio0.txpower='33'
+          uci set wireless.default_radio0.ssid='AL-YAHYAWI2.4G'
+          uci set wireless.default_radio0.beacon_int='50'
+          uci set wireless.default_radio0.dtim_period='1'
+          uci set wireless.default_radio0.disassoc_low_ack='0'
+
+          uci set wireless.radio1.disabled='0'
+          uci set wireless.radio1.channel='36'
+          uci set wireless.radio1.country='PA'
+          uci -q delete wireless.radio1.txpower
+          uci set wireless.default_radio1.ssid='AL-YAHYAWI5G'
+          uci set wireless.default_radio1.beacon_int='100'
+          uci set wireless.default_radio1.dtim_period='2'
+          uci set wireless.default_radio1.disassoc_low_ack='0'
+
+          uci commit system
+          uci commit wireless
+
+          for service in dnsmasq firewall odhcpd; do
+            if [ -x "/etc/init.d/$service" ]; then
+              /etc/init.d/"$service" stop
+              /etc/init.d/"$service" disable
+            fi
+          done
+          exit 0
+          EOF
+
+          sudo python3 - <<'PY'
+          from pathlib import Path
+          p = Path("rootfs/www/luci-static/resources/view/tecsmart-quicksetup/main.js")
+          if not p.is_file():
+              raise SystemExit("ERROR: Quick Setup main.js not found")
+          s = p.read_text()
+          old = "يمكنك استخدام هذه الإضافة الخاصة بميكروتيك يمن لبرمجة الراوتر خلال ثواني فقط"
+          new = "يمكنك استخدام هذه الإضافة الخاصة باليحيوي للتجارة ومستلزمات الشبكات لبرمجة الراوتر خلال ثواني فقط"
+          if old not in s:
+              raise SystemExit("ERROR: Original Quick Setup text not found; refusing to guess")
+          p.write_text(s.replace(old, new))
+          print("Quick Setup text patched.")
+          PY
+
+          sudo mksquashfs rootfs "$FW_DIR/root.new" \
+            -comp xz -b 262144 -noappend -all-root -no-xattrs
+
+          sudo mv "$FW_DIR/root.new" "$FW_DIR/root"
+
+      - name: Package candidate sysupgrade
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          tar --format=ustar --sort=name --mtime='@0' \
+            --owner=0 --group=0 --numeric-owner \
+            -cf output/SIMAX1800T-AL-YAHYAWI-sysupgrade.bin \
+            -C work sysupgrade-sim_simax1800t
+
+          tar -tf output/SIMAX1800T-AL-YAHYAWI-sysupgrade.bin
+          tar -xOf output/SIMAX1800T-AL-YAHYAWI-sysupgrade.bin \
+            sysupgrade-sim_simax1800t/CONTROL
+          sha256sum output/SIMAX1800T-AL-YAHYAWI-sysupgrade.bin
+
+      - name: Upload candidate firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: SIMAX1800T-AL-YAHYAWI-candidate
+          path: output/SIMAX1800T-AL-YAHYAWI-sysupgrade.bin
+          if-no-files-found: error
