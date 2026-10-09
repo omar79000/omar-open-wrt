@@ -1,0 +1,68 @@
+
+name: Unpack SIMAX1800T Firmware
+
+on:
+  workflow_dispatch:
+
+jobs:
+  unpack:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential squashfs-tools u-boot-tools binwalk tree
+
+      - name: Locate Firmware File
+        run: |
+          # البحث عن ملف السوفت الخاص بـ SIMAX1800T
+          FW=$(find . -name "*SIMAX1800T*" -o -name "*.bin" | head -n 1)
+          echo "FIRMWARE_PATH=$FW" >> $GITHUB_ENV
+          echo "Found firmware: $FW"
+
+      - name: Unpack Sysupgrade Container
+        run: |
+          mkdir -p extracted
+          # محاولة تفكيك حاوية sysupgrade (غالباً تكون tar)
+          if ! tar -xf "$FIRMWARE_PATH" -C extracted 2>/dev/null; then
+            echo "Using binwalk extraction..."
+            binwalk -e --mtd -C extracted "$FIRMWARE_PATH"
+          fi
+
+      - name: Extract RootFS (SquashFS)
+        run: |
+          mkdir -p rootfs_unpacked
+          SQ_FILE=$(find extracted -type f \( -name "*squashfs*" -o -name "root" \) | head -n 1)
+          if [ -n "$SQ_FILE" ]; then
+            sudo unsquashfs -d rootfs_unpacked "$SQ_FILE"
+          else
+            echo "Copying extracted root directly..."
+            sudo cp -a extracted/*root*/. rootfs_unpacked/ 2>/dev/null || true
+          fi
+
+      - name: Generate Inventory and Config Reports
+        run: |
+          mkdir -p report
+          # جرد الملفات والصلاحيات
+          sudo find rootfs_unpacked -exec ls -ld {} + > report/files_inventory.txt
+          # بصمات المكونات
+          sudo find rootfs_unpacked -type f -exec sha256sum {} + > report/checksums.txt
+          # نسْخ إعدادات UCI المسؤولة عن الضبط الافتراضي
+          if [ -d "rootfs_unpacked/etc/uci-defaults" ]; then
+            cp -r rootfs_unpacked/etc/uci-defaults report/
+          fi
+          if [ -d "rootfs_unpacked/etc/config" ]; then
+            cp -r rootfs_unpacked/etc/config report/
+          fi
+
+      - name: Upload Unpacked Output
+        uses: actions/upload-artifact@v4
+        with:
+          name: SIMAX1800T-Unpacked-RootFS
+          path: |
+            rootfs_unpacked/
+            report/
