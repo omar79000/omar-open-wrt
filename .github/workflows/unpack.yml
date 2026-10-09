@@ -1,4 +1,3 @@
-
 name: Unpack SIMAX1800T Firmware
 
 on:
@@ -35,7 +34,6 @@ jobs:
       - name: Extract Firmware Container
         run: |
           echo "جاري تفكيك السوفت وير..."
-          # محاولة تفكيك الحاوية كـ tar أوليًا
           if tar -xf "$FW_PATH" -C extracted 2>/dev/null; then
             echo "تم تفكيك الأرشيف بواسطة tar بنجاح."
           else
@@ -45,7 +43,6 @@ jobs:
 
       - name: Extract RootFS (SquashFS)
         run: |
-          # البحث عن ملف SquashFS المستخرج
           SQ_FILE=$(find extracted -type f \( -name "*squashfs*" -o -name "root*" -o -name "*.sqsh" \) | head -n 1)
           
           if [ -n "$SQ_FILE" ]; then
@@ -62,20 +59,23 @@ jobs:
 
       - name: Generate Reports and Inventory
         run: |
-          # تسجيل معلومات الملف الأصلي
           echo "=== SHA256 Checksum ===" > report/info.txt
           sha256sum "$FW_PATH" >> report/info.txt
           
-          # جرد الملفات مع الصلاحيات
           sudo find rootfs_unpacked -exec ls -ld {} + > report/files_inventory.txt 2>/dev/null || true
           
-          # نسخ ملفات الإعدادات والـ UCI Defaults
           if [ -d "rootfs_unpacked/etc/uci-defaults" ]; then
             sudo cp -r rootfs_unpacked/etc/uci-defaults report/ 2>/dev/null || true
           fi
           if [ -d "rootfs_unpacked/etc/config" ]; then
             sudo cp -r rootfs_unpacked/etc/config report/ 2>/dev/null || true
           fi
+
+      - name: Fix Permissions for Upload Step
+        run: |
+          # تغيير صلاحيات ومالك المجلدات حتى يتنسى لمستضيف GitHub Actions رفعها بدون Permission Denied
+          sudo chown -R runner:docker rootfs_unpacked report extracted
+          sudo chmod -R 777 rootfs_unpacked report extracted
 
       - name: Upload Unpacked Artifacts
         uses: actions/upload-artifact@v4
