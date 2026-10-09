@@ -12,57 +12,75 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Install Tools
+      - name: Install Analysis Tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential squashfs-tools u-boot-tools binwalk tree
+          sudo apt-get install -y build-essential squashfs-tools u-boot-tools binwalk tree zstd xz-utils
 
-      - name: Locate Firmware File
+      - name: Prepare Directories and Locate Firmware
         run: |
-          # البحث عن ملف السوفت الخاص بـ SIMAX1800T
-          FW=$(find . -name "*SIMAX1800T*" -o -name "*.bin" | head -n 1)
-          echo "FIRMWARE_PATH=$FW" >> $GITHUB_ENV
-          echo "Found firmware: $FW"
+          mkdir -p extracted rootfs_unpacked report
+          
+          # البحث عن ملف السوفت وير
+          FW_FILE=$(find . -maxdepth 2 -type f \( -name "*SIMAX1800T*" -o -name "*.bin" -o -name "*.tar" \) | head -n 1)
+          
+          if [ -z "$FW_FILE" ]; then
+            echo "خطأ: لم يتم العثور على أي ملف سوفت وير!"
+            exit 1
+          fi
+          
+          echo "FW_PATH=$FW_FILE" >> $GITHUB_ENV
+          echo "Found file: $FW_FILE"
 
-      - name: Unpack Sysupgrade Container
+      - name: Extract Firmware Container
         run: |
-          mkdir -p extracted
-          # محاولة تفكيك حاوية sysupgrade (غالباً تكون tar)
-          if ! tar -xf "$FIRMWARE_PATH" -C extracted 2>/dev/null; then
-            echo "Using binwalk extraction..."
-            binwalk -e --mtd -C extracted "$FIRMWARE_PATH"
+          echo "جاري تفكيك السوفت وير..."
+          # محاولة تفكيك الحاوية كـ tar أوليًا
+          if tar -xf "$FW_PATH" -C extracted 2>/dev/null; then
+            echo "تم تفكيك الأرشيف بواسطة tar بنجاح."
+          else
+            echo "محاولة التفكيك باستخدام binwalk..."
+            binwalk -e --mtd -C extracted "$FW_PATH" || true
           fi
 
       - name: Extract RootFS (SquashFS)
         run: |
-          mkdir -p rootfs_unpacked
-          SQ_FILE=$(find extracted -type f \( -name "*squashfs*" -o -name "root" \) | head -n 1)
+          # البحث عن ملف SquashFS المستخرج
+          SQ_FILE=$(find extracted -type f \( -name "*squashfs*" -o -name "root*" -o -name "*.sqsh" \) | head -n 1)
+          
           if [ -n "$SQ_FILE" ]; then
-            sudo unsquashfs -d rootfs_unpacked "$SQ_FILE"
+            echo "جاري فك SquashFS من: $SQ_FILE"
+            sudo unsquashfs -d rootfs_unpacked "$SQ_FILE" || true
           else
-            echo "Copying extracted root directly..."
-            sudo cp -a extracted/*root*/. rootfs_unpacked/ 2>/dev/null || true
+            echo "تنبيه: لم يتم العثور على ملف SquashFS فرعي، جاري نسخ محتويات Root مباشرة..."
+            if [ -d "extracted/sysupgrade-*" ]; then
+              sudo cp -a extracted/sysupgrade-*/root/. rootfs_unpacked/ 2>/dev/null || true
+            else
+              sudo cp -a extracted/. rootfs_unpacked/ 2>/dev/null || true
+            fi
           fi
 
-      - name: Generate Inventory and Config Reports
+      - name: Generate Reports and Inventory
         run: |
-          mkdir -p report
-          # جرد الملفات والصلاحيات
-          sudo find rootfs_unpacked -exec ls -ld {} + > report/files_inventory.txt
-          # بصمات المكونات
-          sudo find rootfs_unpacked -type f -exec sha256sum {} + > report/checksums.txt
-          # نسْخ إعدادات UCI المسؤولة عن الضبط الافتراضي
+          # تسجيل معلومات الملف الأصلي
+          echo "=== SHA256 Checksum ===" > report/info.txt
+          sha256sum "$FW_PATH" >> report/info.txt
+          
+          # جرد الملفات مع الصلاحيات
+          sudo find rootfs_unpacked -exec ls -ld {} + > report/files_inventory.txt 2>/dev/null || true
+          
+          # نسخ ملفات الإعدادات والـ UCI Defaults
           if [ -d "rootfs_unpacked/etc/uci-defaults" ]; then
-            cp -r rootfs_unpacked/etc/uci-defaults report/
+            sudo cp -r rootfs_unpacked/etc/uci-defaults report/ 2>/dev/null || true
           fi
           if [ -d "rootfs_unpacked/etc/config" ]; then
-            cp -r rootfs_unpacked/etc/config report/
+            sudo cp -r rootfs_unpacked/etc/config report/ 2>/dev/null || true
           fi
 
-      - name: Upload Unpacked Output
+      - name: Upload Unpacked Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: SIMAX1800T-Unpacked-RootFS
+          name: SIMAX1800T-Unpacked
           path: |
             rootfs_unpacked/
             report/
