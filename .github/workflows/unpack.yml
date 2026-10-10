@@ -128,7 +128,7 @@ jobs:
           ROOT_DIR="${{ steps.layout.outputs.root_dir }}"
           mkdir -p work/rootfs
 
-                    sudo unsquashfs -d work/rootfs "$ROOT_DIR/root"
+          unsquashfs -d work/rootfs "$ROOT_DIR/root"
 
           ROOT="work/rootfs"
           BRAND='اليحيوي للتجارة ومستلزمات الشبكات'
