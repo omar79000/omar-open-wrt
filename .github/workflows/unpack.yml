@@ -1,182 +1,357 @@
-
 name: Modify and Rebuild SIMAX1800T Sysupgrade
 
 on:
-  workflow_dispatch:
+workflow_dispatch:
 
 permissions:
-  contents: read
+contents: read
 
 jobs:
-  modify-build:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+modify-build:
+runs-on: ubuntu-latest
 
-      - name: Install tools
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y squashfs-tools xz-utils
+steps:
+  - name: Checkout repository
+    uses: actions/checkout@v4
 
-      - name: Find and extract original sysupgrade image
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p extracted rootfs_unpacked output report
+  - name: Install tools
+    shell: bash
+    run: |
+      set -euo pipefail
+      sudo apt-get update
+      sudo apt-get install -y squashfs-tools xz-utils file python3
 
-          # Prefer the known original image filename; otherwise accept one matching SIMAX1800T.
-          FW_FILE=$(find . -maxdepth 2 -type f -name '*SIMAX1800T*' ! -path './.git/*' | head -n 1)
-          if [ -z "$FW_FILE" ]; then
-            echo "ERROR: No SIMAX1800T firmware image found in the repository."
-            exit 1
-          fi
-          echo "Using firmware: $FW_FILE"
-          echo "FW_PATH=$FW_FILE" >> "$GITHUB_ENV"
+  - name: Find and extract original sysupgrade image
+    shell: bash
+    run: |
+      set -euo pipefail
 
-          if ! tar -tf "$FW_FILE" >/tmp/firmware-list.txt 2>/dev/null; then
-            echo "ERROR: Input is not a tar-compatible sysupgrade image. Refusing to continue."
-            file "$FW_FILE"
-            exit 1
-          fi
+      mkdir -p extracted rootfs_unpacked output report
 
-          tar -xf "$FW_FILE" -C extracted
-          FW_DIR=$(find extracted -mindepth 1 -maxdepth 1 -type d -name 'sysupgrade-*' | head -n 1)
-          if [ -z "$FW_DIR" ]; then
-            echo "ERROR: Expected sysupgrade-* directory not found."
-            find extracted -maxdepth 3 -type f -print
-            exit 1
-          fi
+      # Find the firmware image deterministically.
+      mapfile -t candidates < <(
+        find . -maxdepth 3 -type f -iname '*SIMAX1800T*' \
+          ! -path './.git/*' \
+          ! -path './extracted/*' \
+          ! -path './output/*' | sort
+      )
 
-          for part in CONTROL kernel root; do
-            if [ ! -f "$FW_DIR/$part" ]; then
-              echo "ERROR: Missing required sysupgrade component: $FW_DIR/$part"
-              exit 1
-            fi
-          done
+      if [ "${#candidates[@]}" -eq 0 ]; then
+        echo "::error::No SIMAX1800T firmware image found."
+        echo "Upload the original firmware to the repository first."
+        find . -maxdepth 3 -type f -print | head -200
+        exit 1
+      fi
 
-          echo "FW_DIR=$FW_DIR" >> "$GITHUB_ENV"
-          sha256sum "$FW_DIR/CONTROL" "$FW_DIR/kernel" > original-components.sha256
-          sudo unsquashfs -d rootfs_unpacked "$FW_DIR/root"
-          test -f rootfs_unpacked/etc/config/wireless
-          test -f rootfs_unpacked/etc/config/system
-          test -f rootfs_unpacked/www/luci-static/resources/view/tecsmart-quicksetup/main.js
+      FW_FILE=""
+      for candidate in "${candidates[@]}"; do
+        if [[ "$candidate" == *sysupgrade* || "$candidate" == *Sysupgrade* ]]; then
+          FW_FILE="$candidate"
+          break
+        fi
+      done
 
-      - name: Apply branding and first-boot Wi-Fi/service settings
-        shell: bash
-        run: |
-          set -euo pipefail
+      FW_FILE="${FW_FILE:-${candidates[0]}}"
 
-          sudo tee rootfs_unpacked/etc/banner >/dev/null <<'BANNER'
-          =======================================================
-            اليحيوي للتجارة ومستلزمات الشبكات
-            AL-YAHYAWI-OPENWRT
-          =======================================================
-          BANNER
+      echo "Using firmware: $FW_FILE"
+      echo "FW_PATH=$FW_FILE" >> "$GITHUB_ENV"
 
-          sudo mkdir -p rootfs_unpacked/etc/uci-defaults
-          sudo tee rootfs_unpacked/etc/uci-defaults/99-al-yahyawi-simaxi >/dev/null <<'DEFAULTS'
-          #!/bin/sh
-          # First-boot settings for AL-YAHYAWI SIMAX1800T
-          uci set system.@system[0].hostname='AL-YAHYAWI-OPENWRT'
-          uci set system.@system[0].description='اليحيوي للتجارة ومستلزمات الشبكات'
+      # Confirm that the input is a readable tar-compatible sysupgrade image.
+      if ! tar -tf "$FW_FILE" > output/input-archive-list.txt 2> output/input-tar-error.txt; then
+        echo "::error::Input is not a tar-compatible sysupgrade image."
+        file "$FW_FILE" || true
+        cat output/input-tar-error.txt || true
+        exit 1
+      fi
 
-          # 2.4 GHz defaults
-          if uci -q get wireless.radio0 >/dev/null; then
-            uci set wireless.radio0.disabled='0'
-            uci set wireless.radio0.channel='11'
-            uci set wireless.radio0.txpower='33'
-          fi
-          if uci -q get wireless.default_radio0 >/dev/null; then
-            uci set wireless.default_radio0.ssid='AL-YAHYAWI2.4G'
-            uci set wireless.default_radio0.beacon_int='50'
-            uci set wireless.default_radio0.dtim_period='1'
-            uci set wireless.default_radio0.disassoc_low_ack='0'
-          fi
+      tar -xf "$FW_FILE" -C extracted
 
-          # 5 GHz defaults
-          if uci -q get wireless.radio1 >/dev/null; then
-            uci set wireless.radio1.disabled='0'
-            uci set wireless.radio1.channel='36'
-            uci set wireless.radio1.country='PA'
-            uci -q delete wireless.radio1.txpower
-          fi
-          if uci -q get wireless.default_radio1 >/dev/null; then
-            uci set wireless.default_radio1.ssid='AL-YAHYAWI5G'
-            uci set wireless.default_radio1.beacon_int='100'
-            uci set wireless.default_radio1.dtim_period='2'
-            uci set wireless.default_radio1.disassoc_low_ack='0'
-          fi
+      mapfile -t fw_dirs < <(
+        find extracted -mindepth 1 -maxdepth 3 \
+          -type d -name 'sysupgrade-*' | sort
+      )
 
-          uci commit system
-          uci commit wireless
+      if [ "${#fw_dirs[@]}" -ne 1 ]; then
+        echo "::error::Expected exactly one sysupgrade-* directory; found ${#fw_dirs[@]}."
+        find extracted -maxdepth 4 -print
+        exit 1
+      fi
 
-          # Disable these services for the intended bridge/AP configuration.
-          for service in dnsmasq firewall odhcpd; do
-            if [ -x "/etc/init.d/$service" ]; then
-              "/etc/init.d/$service" stop 2>/dev/null || true
-              "/etc/init.d/$service" disable 2>/dev/null || true
-            fi
-          done
-          exit 0
-          DEFAULTS
-          sudo chmod 755 rootfs_unpacked/etc/uci-defaults/99-al-yahyawi-simaxi
+      FW_DIR="${fw_dirs[0]}"
+      echo "FW_DIR=$FW_DIR" >> "$GITHUB_ENV"
 
-          if [ -f rootfs_unpacked/etc/issue ]; then
-            printf '\nاليحيوي للتجارة ومستلزمات الشبكات\n' | sudo tee -a rootfs_unpacked/etc/issue >/dev/null
-          fi
+      for part in CONTROL kernel root; do
+        if [ ! -f "$FW_DIR/$part" ]; then
+          echo "::error::Missing required sysupgrade component: $FW_DIR/$part"
+          find "$FW_DIR" -maxdepth 2 -type f -printf '%P\n' || true
+          exit 1
+        fi
+      done
 
-          sudo python3 - <<'PY'
-          from pathlib import Path
-          p = Path("rootfs_unpacked/www/luci-static/resources/view/tecsmart-quicksetup/main.js")
-          text = p.read_text(encoding="utf-8")
-          old = "يمكنك استخدام هذه الإضافة الخاصة بميكروتيك يمن لبرمجة الراوتر خلال ثواني فقط"
-          new = "يمكنك استخدام هذه الإضافة الخاصة باليحيوي للتجارة ومستلزمات الشبكات لبرمجة الراوتر خلال ثواني فقط"
-          if old not in text:
-              raise SystemExit("ERROR: Original Quick Programming text was not found; stopping to avoid an unchanged UI build.")
+      # Keep hashes of the original components that must not change.
+      sha256sum "$FW_DIR/CONTROL" "$FW_DIR/kernel" > original-components.sha256
+
+      # Extract the original SquashFS root filesystem.
+      sudo unsquashfs -no-progress -d rootfs_unpacked "$FW_DIR/root"
+
+      echo "=== Root filesystem layout ==="
+      find rootfs_unpacked -maxdepth 4 -print | head -200
+
+      echo "=== Checking important files ==="
+      for path in \
+        etc/config/wireless \
+        etc/config/system \
+        www/luci-static/resources/view/tecsmart-quicksetup/main.js
+      do
+        if [ -f "rootfs_unpacked/$path" ]; then
+          echo "FOUND: $path"
+        else
+          echo "MISSING: $path"
+        fi
+      done
+
+      if [ ! -d rootfs_unpacked/etc ]; then
+        echo "::error::The extracted root filesystem has no /etc directory."
+        exit 1
+      fi
+
+      # Find the Quick Programming page even if its path differs.
+      QUICK_JS="$(
+        find rootfs_unpacked -type f \
+          -path '*/tecsmart-quicksetup/main.js' -print -quit || true
+      )"
+
+      echo "QUICK_JS=$QUICK_JS" >> "$GITHUB_ENV"
+
+      if [ -n "$QUICK_JS" ]; then
+        echo "Quick Programming page found: $QUICK_JS"
+      else
+        echo "WARNING: Quick Programming page not found."
+      fi
+
+  - name: Apply branding and first-boot settings
+    shell: bash
+    run: |
+      set -euo pipefail
+
+      # Add the company name to the console banner.
+      sudo tee rootfs_unpacked/etc/banner >/dev/null <<'BANNER'
+      =======================================================
+        اليحيوي للتجارة ومستلزمات الشبكات
+        AL-YAHYAWI-OPENWRT
+      =======================================================
+      BANNER
+
+      sudo mkdir -p rootfs_unpacked/etc/uci-defaults
+
+      # Apply settings on the router's first boot.
+      sudo tee rootfs_unpacked/etc/uci-defaults/99-al-yahyawi-simaxi >/dev/null <<'DEFAULTS'
+      #!/bin/sh
+      # First-boot settings for AL-YAHYAWI SIMAX1800T.
+
+      if ! uci -q get 'system.@system[0]' >/dev/null; then
+        echo "WARNING: System UCI configuration is unavailable."
+        exit 0
+      fi
+
+      uci set 'system.@system[0].hostname=AL-YAHYAWI-OPENWRT'
+      uci set 'system.@system[0].description=اليحيوي للتجارة ومستلزمات الشبكات'
+
+      # Detect wireless radios using their configured band or hardware mode.
+      radios="$(uci show wireless 2>/dev/null |
+        sed -n 's/^wireless\.\([^.=]*\)=wifi-device$/\1/p')"
+
+      radio24=''
+      radio5=''
+
+      for r in $radios; do
+        band="$(uci -q get wireless."$r".band 2>/dev/null || true)"
+        hwmode="$(uci -q get wireless."$r".hwmode 2>/dev/null || true)"
+
+        case "$band:$hwmode" in
+          2g:*|*:11g|*:11ng|*:11axg|*:11beg)
+            [ -n "$radio24" ] || radio24="$r"
+            ;;
+          5g:*|*:11a|*:11ac|*:11na|*:11ax|*:11axa|*:11be)
+            [ -n "$radio5" ] || radio5="$r"
+            ;;
+        esac
+      done
+
+      # Conventional OpenWrt radio names are used only as a fallback.
+      if [ -z "$radio24" ] && uci -q get wireless.radio0 >/dev/null 2>&1; then
+        radio24='radio0'
+      fi
+
+      if [ -z "$radio5" ] && uci -q get wireless.radio1 >/dev/null 2>&1; then
+        radio5='radio1'
+      fi
+
+      if [ -n "$radio24" ]; then
+        uci set wireless."$radio24".disabled='0'
+        uci set wireless."$radio24".channel='11'
+
+        # Requested value; actual power depends on hardware, driver,
+        # regulatory limits and supported radio capabilities.
+        uci set wireless."$radio24".txpower='33'
+      else
+        echo "WARNING: 2.4 GHz radio was not detected."
+      fi
+
+      if [ -n "$radio5" ]; then
+        uci set wireless."$radio5".disabled='0'
+        uci set wireless."$radio5".channel='36'
+        uci set wireless."$radio5".country='PA'
+
+        # Remove the override so the driver can choose a supported value.
+        uci -q delete wireless."$radio5".txpower || true
+      else
+        echo "WARNING: 5 GHz radio was not detected."
+      fi
+
+      # Apply settings to AP interfaces associated with the detected radios.
+      ifaces="$(uci show wireless 2>/dev/null |
+        sed -n 's/^wireless\.\([^.=]*\)=wifi-iface$/\1/p')"
+
+      for i in $ifaces; do
+        dev="$(uci -q get wireless."$i".device 2>/dev/null || true)"
+        mode="$(uci -q get wireless."$i".mode 2>/dev/null || true)"
+
+        [ "$mode" = 'ap' ] || continue
+
+        if [ -n "$radio24" ] && [ "$dev" = "$radio24" ]; then
+          uci set wireless."$i".ssid='AL-YAHYAWI2.4G'
+          uci set wireless."$i".beacon_int='50'
+          uci set wireless."$i".dtim_period='1'
+          uci set wireless."$i".disassoc_low_ack='0'
+
+        elif [ -n "$radio5" ] && [ "$dev" = "$radio5" ]; then
+          uci set wireless."$i".ssid='AL-YAHYAWI5G'
+          uci set wireless."$i".beacon_int='100'
+          uci set wireless."$i".dtim_period='2'
+          uci set wireless."$i".disassoc_low_ack='0'
+        fi
+      done
+
+      uci commit system
+      uci commit wireless
+
+      # Requested bridge/AP profile.
+      # Disabling these services can remove DHCP, DNS and firewall protection.
+      for service in dnsmasq firewall odhcpd; do
+        if [ -x "/etc/init.d/$service" ]; then
+          "/etc/init.d/$service" stop 2>/dev/null || true
+          "/etc/init.d/$service" disable 2>/dev/null || true
+        fi
+      done
+
+      exit 0
+      DEFAULTS
+
+      sudo chmod 755 rootfs_unpacked/etc/uci-defaults/99-al-yahyawi-simaxi
+
+      if [ -f rootfs_unpacked/etc/issue ]; then
+        printf '\nاليحيوي للتجارة ومستلزمات الشبكات\n' |
+          sudo tee -a rootfs_unpacked/etc/issue >/dev/null
+      fi
+
+      # Update the Quick Programming page when it exists.
+      if [ -n "${QUICK_JS:-}" ] && [ -f "$QUICK_JS" ]; then
+        sudo python3 - "$QUICK_JS" <<'PY'
+      from pathlib import Path
+      import sys
+
+      p = Path(sys.argv[1])
+      text = p.read_text(encoding="utf-8")
+
+      old = "يمكنك استخدام هذه الإضافة الخاصة بميكروتيك يمن لبرمجة الراوتر خلال ثواني فقط"
+      new = "يمكنك استخدام هذه الإضافة الخاصة باليحيوي للتجارة ومستلزمات الشبكات لبرمجة الراوتر خلال ثواني فقط"
+
+      if old in text:
           p.write_text(text.replace(old, new), encoding="utf-8")
           print("Quick Programming text updated.")
-          PY
+      elif new in text:
+          print("Quick Programming text is already branded.")
+      else:
+          print("WARNING: Original text was not found; page left unchanged.")
+      PY
+      else
+        echo "WARNING: Quick Programming page is missing; skipped text replacement."
+      fi
 
-      - name: Repack root filesystem and assemble sysupgrade image
-        shell: bash
-        run: |
-          set -euo pipefail
+  - name: Repack root filesystem and assemble sysupgrade image
+    shell: bash
+    run: |
+      set -euo pipefail
 
-          # Keep original CONTROL and kernel; replace only the SquashFS root filesystem.
-          sudo mksquashfs rootfs_unpacked "$FW_DIR/root.new" -comp xz -b 262144 -noappend
-          sudo mv "$FW_DIR/root.new" "$FW_DIR/root"
-          sudo unsquashfs -s "$FW_DIR/root"
+      # Rebuild the SquashFS root filesystem.
+      sudo mksquashfs rootfs_unpacked "$FW_DIR/root.new" \
+        -comp xz -b 262144 -noappend
 
-          FW_DIR_NAME=$(basename "$FW_DIR")
-          tar --format=ustar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
-            -cf output/SIMAX1800T-AL-YAHYAWI-sysupgrade.bin -C extracted "$FW_DIR_NAME"
+      sudo unsquashfs -s "$FW_DIR/root.new" >/dev/null
+      sudo mv "$FW_DIR/root.new" "$FW_DIR/root"
 
-          tar -tf output/SIMAX1800T-AL-YAHYAWI-sysupgrade.bin | tee output/archive-list.txt
-          grep -Fx "$FW_DIR_NAME/CONTROL" output/archive-list.txt
-          grep -Fx "$FW_DIR_NAME/kernel" output/archive-list.txt
-          grep -Fx "$FW_DIR_NAME/root" output/archive-list.txt
+      FW_DIR_NAME="$(basename "$FW_DIR")"
 
-          # Confirm that the original boot/control components are unchanged.
-          sha256sum -c original-components.sha256
+      # Assemble the archive while preserving the required directory layout.
+      tar --format=ustar --sort=name --mtime='@0' \
+        --owner=0 --group=0 --numeric-owner \
+        -cf output/SIMAX1800T-AL-YAHYAWI-sysupgrade.bin \
+        -C extracted "$FW_DIR_NAME"
 
-          # Validate the modified SquashFS contents inside the final sysupgrade archive.
-          tar -xOf output/SIMAX1800T-AL-YAHYAWI-sysupgrade.bin "$FW_DIR_NAME/root" > output/root-check.squashfs
-          sudo unsquashfs -s output/root-check.squashfs
-          sudo unsquashfs -cat output/root-check.squashfs etc/uci-defaults/99-al-yahyawi-simaxi | grep -F 'AL-YAHYAWI-OPENWRT'
-          sudo unsquashfs -cat output/root-check.squashfs www/luci-static/resources/view/tecsmart-quicksetup/main.js | grep -F 'اليحيوي للتجارة ومستلزمات الشبكات'
+      echo "=== Final archive contents ==="
+      tar -tf output/SIMAX1800T-AL-YAHYAWI-sysupgrade.bin |
+        tee output/archive-list.txt
 
-          sha256sum output/SIMAX1800T-AL-YAHYAWI-sysupgrade.bin | tee output/SHA256SUMS.txt
-          sha256sum "$FW_PATH" > report/original-firmware-sha256.txt
+      for part in CONTROL kernel root; do
+        if ! grep -Fx "$FW_DIR_NAME/$part" output/archive-list.txt >/dev/null; then
+          echo "::error::Final archive is missing $FW_DIR_NAME/$part"
+          exit 1
+        fi
+      done
 
-      - name: Upload rebuilt sysupgrade image
-        uses: actions/upload-artifact@v4
-        with:
-          name: SIMAX1800T-AL-YAHYAWI-MODIFIED-SYSUPGRADE
-          if-no-files-found: error
-          path: |
-            output/SIMAX1800T-AL-YAHYAWI-sysupgrade.bin
-            output/SHA256SUMS.txt
-            output/archive-list.txt
-            report/original-firmware-sha256.txt
+      # Confirm that the original CONTROL and kernel were not changed.
+      sha256sum -c original-components.sha256
+
+      # Extract the final root component and validate its SquashFS structure.
+      tar -xOf output/SIMAX1800T-AL-YAHYAWI-sysupgrade.bin \
+        "$FW_DIR_NAME/root" > output/root-check.squashfs
+
+      sudo unsquashfs -s output/root-check.squashfs
+
+      # Verify that the branding defaults and banner are in the final image.
+      sudo unsquashfs -cat output/root-check.squashfs \
+        etc/uci-defaults/99-al-yahyawi-simaxi |
+        grep -F 'AL-YAHYAWI-OPENWRT' >/dev/null
+
+      sudo unsquashfs -cat output/root-check.squashfs etc/banner |
+        grep -F 'اليحيوي للتجارة ومستلزمات الشبكات' >/dev/null
+
+      if [ -n "${QUICK_JS:-}" ]; then
+        QUICK_REL="${QUICK_JS#rootfs_unpacked/}"
+
+        if sudo unsquashfs -cat output/root-check.squashfs "$QUICK_REL" 2>/dev/null |
+          grep -F 'اليحيوي للتجارة ومستلزمات الشبكات' >/dev/null; then
+          echo "Quick Programming branding verified."
+        else
+          echo "WARNING: Quick Programming branding was not verified."
+        fi
+      fi
+
+      # Save checksums for verification after download.
+      sha256sum output/SIMAX1800T-AL-YAHYAWI-sysupgrade.bin |
+        tee output/SHA256SUMS.txt
+
+      sha256sum "$FW_PATH" > report/original-firmware-sha256.txt
+
+  - name: Upload rebuilt sysupgrade image
+    uses: actions/upload-artifact@v4
+    with:
+      name: SIMAX1800T-AL-YAHYAWI-MODIFIED-SYSUPGRADE
+      if-no-files-found: error
+      path: |
+        output/SIMAX1800T-AL-YAHYAWI-sysupgrade.bin
+        output/SHA256SUMS.txt
+        output/archive-list.txt
+        output/input-archive-list.txt
+        report/original-firmware-sha256.txt
