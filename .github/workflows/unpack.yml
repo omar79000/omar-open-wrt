@@ -17,37 +17,29 @@ jobs:
       - name: Install firmware tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            file \
-            squashfs-tools \
-            binwalk \
-            xxd \
-            tar \
-            gzip \
-            zstd
+          sudo apt-get install -y file squashfs-tools binwalk xxd tar gzip zstd python3
 
       - name: Find and inspect original firmware
         id: inspect
         shell: bash
         run: |
           set -u
-
           mkdir -p inspection
 
           FIRMWARE="$(find . -maxdepth 2 -type f \
-            -name '*SIMAX1800T*FINAL*.bin' \
-            -print -quit)"
+            -name '*SIMAX1800T*FINAL*.bin' -print -quit)"
 
           if [ -z "$FIRMWARE" ]; then
             FIRMWARE="$(find . -maxdepth 2 -type f \
-              -name '*SIMAX1800T*.bin' \
-              -print -quit)"
+              -name '*SIMAX1800T*.bin' -print -quit)"
           fi
 
           if [ -z "$FIRMWARE" ]; then
-            echo "لم يتم العثور على ملف Firmware."
-            find . -maxdepth 2 -type f -print
+            echo "Firmware file not found."
+            find . -maxdepth 2 -type f -print \
+              > inspection/repository-files.txt
             echo "recognized=false" >> "$GITHUB_OUTPUT"
+            echo "tar_detected=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -60,7 +52,6 @@ jobs:
           xxd -l 256 "$FIRMWARE" > inspection/header-hex.txt
           strings -n 8 "$FIRMWARE" | head -n 500 \
             > inspection/strings.txt || true
-
           binwalk "$FIRMWARE" > inspection/binwalk.txt 2>&1 || true
 
           if tar -tf "$FIRMWARE" > inspection/tar-list.txt 2>&1; then
@@ -71,12 +62,10 @@ jobs:
 
           cat inspection/file-type.txt
           cat inspection/sha256.txt
-          cat inspection/tar-list.txt || true
-          cat inspection/binwalk.txt
+          cat inspection/tar-list.txt 2>/dev/null || true
+          cat inspection/binwalk.txt 2>/dev/null || true
 
-          echo "recognized=false" >> "$GITHUB_OUTPUT"
-
-      - name: Check whether firmware archive layout is supported
+      - name: Check firmware archive layout
         id: layout
         shell: bash
         run: |
@@ -86,16 +75,20 @@ jobs:
 
           if [ -z "$FIRMWARE" ] || \
              [ "${{ steps.inspect.outputs.tar_detected }}" != "true" ]; then
-            echo "Archive is not a readable TAR. Rebuild skipped."
+            echo "Firmware is not a recognized TAR archive. Rebuild skipped."
             exit 0
           fi
 
           mkdir -p work/archive
 
-          if ! tar -xf "$FIRMWARE" -C work/archive; then
-            echo "Unable to extract as TAR. Rebuild skipped."
+          if ! tar --no-same-owner --no-same-permissions \
+            -xf "$FIRMWARE" -C work/archive; then
+            echo "Extraction failed. Rebuild skipped."
             exit 0
           fi
+
+          find work/archive -type f -print \
+            > inspection/extracted-files.txt
 
           ROOT_DIR="$(find work/archive -type f -name CONTROL \
             -printf '%h\n' | head -n 1)"
@@ -103,21 +96,16 @@ jobs:
           if [ -z "$ROOT_DIR" ] || \
              [ ! -f "$ROOT_DIR/kernel" ] || \
              [ ! -f "$ROOT_DIR/root" ]; then
-            echo "Expected CONTROL, kernel, and root files were not found."
-            echo "Rebuild skipped to protect the original firmware format."
-            find work/archive -maxdepth 4 -type f -print \
-              > inspection/extracted-files.txt
+            echo "Expected CONTROL, kernel, and root files not found."
+            echo "Rebuild skipped to avoid generating an incompatible image."
             exit 0
           fi
 
           echo "root_dir=$ROOT_DIR" >> "$GITHUB_OUTPUT"
           echo "supported=true" >> "$GITHUB_OUTPUT"
-          echo "Recognized sysupgrade archive: $ROOT_DIR"
 
-      - name: Install root filesystem utilities
-        if: steps.layout.outputs.supported == 'true'
-        run: |
-          sudo apt-get install -y squashfs-tools
+          echo "Recognized archive directory: $ROOT_DIR"
+          ls -lah "$ROOT_DIR"
 
       - name: Extract and customize root filesystem
         if: steps.layout.outputs.supported == 'true'
@@ -126,76 +114,97 @@ jobs:
           set -euo pipefail
 
           ROOT_DIR="${{ steps.layout.outputs.root_dir }}"
-          mkdir -p work/rootfs
-
-          unsquashfs -d work/rootfs "$ROOT_DIR/root"
-
           ROOT="work/rootfs"
+
+          mkdir -p work
+          sudo unsquashfs -d "$ROOT" "$ROOT_DIR/root"
+
+          # Preserve root ownership and permissions while allowing
+          # privileged editing of extracted files.
           BRAND='اليحيوي للتجارة ومستلزمات الشبكات'
 
-          mkdir -p "$ROOT/etc/uci-defaults"
-          mkdir -p "$ROOT/etc"
+          sudo mkdir -p "$ROOT/etc/uci-defaults"
 
-          cat > "$ROOT/etc/uci-defaults/99-al-yahyawi" <<'SCRIPT'
+          sudo tee "$ROOT/etc/uci-defaults/99-al-yahyawi" \
+            > /dev/null <<'SCRIPT'
           #!/bin/sh
 
           BRAND='اليحيوي للتجارة ومستلزمات الشبكات'
 
+          # System identity
           uci set system.@system[0].hostname='AL-YAHYAWI-OPENWRT'
           uci set system.@system[0].description="$BRAND"
           uci commit system
 
-          # Wi-Fi defaults: configure existing radios without assuming
-          # their section names or creating duplicate wireless interfaces.
+          # Identify existing radio sections.
           for section in $(uci -q show wireless | sed -n \
             's/^wireless\.\([^.=]*\)=wifi-device$/\1/p'); do
-            band="$(uci -q get wireless."$section".band)"
-            path="$(uci -q get wireless."$section".path)"
-            name="$(uci -q get wireless."$section".name)"
+
+            band="$(uci -q get "wireless.$section.band" 2>/dev/null || true)"
+            path="$(uci -q get "wireless.$section.path" 2>/dev/null || true)"
+            name="$(uci -q get "wireless.$section.name" 2>/dev/null || true)"
 
             case "$band $path $name $section" in
-              *2g*|*2G*|*2.4*|*phy0*)
-                uci set wireless."$section".channel='11'
-                uci set wireless."$section".beacon_int='50'
+              *2g*|*2G*|*2.4*|*radio0*)
+                uci set "wireless.$section.channel=11"
+                uci set "wireless.$section.beacon_int=50"
                 ;;
-              *5g*|*5G*|*5.0*|*phy1*)
-                uci set wireless."$section".channel='36'
-                uci set wireless."$section".country='PA'
-                uci set wireless."$section".beacon_int='100'
+              *5g*|*5G*|*5.0*|*radio1*)
+                uci set "wireless.$section.channel=36"
+                uci set "wireless.$section.country=PA"
+                uci set "wireless.$section.beacon_int=100"
+                uci -q delete "wireless.$section.txpower" || true
                 ;;
             esac
           done
 
+          # Configure existing AP interfaces only.
           for section in $(uci -q show wireless | sed -n \
             's/^wireless\.\([^.=]*\)=wifi-iface$/\1/p'); do
-            mode="$(uci -q get wireless."$section".mode)"
 
-            if [ "$mode" = "ap" ]; then
-              device="$(uci -q get wireless."$section".device)"
-              band="$(uci -q get wireless."$device".band)"
-              path="$(uci -q get wireless."$device".path)"
-              name="$(uci -q get wireless."$device".name)"
-              radio="$device $band $path $name"
+            mode="$(uci -q get "wireless.$section.mode" 2>/dev/null || true)"
+            [ "$mode" = "ap" ] || continue
 
-              case "$radio" in
-                *2g*|*2G*|*2.4*|*phy0*)
-                  uci set wireless."$section".ssid='AL-YAHYAWI2.4G'
-                  uci set wireless."$section".disassoc_low_ack='0'
-                  uci set wireless."$device".disabled='0'
-                  ;;
-                *5g*|*5G*|*5.0*|*phy1*)
-                  uci set wireless."$section".ssid='AL-YAHYAWI5G'
-                  uci set wireless."$section".disassoc_low_ack='0'
-                  uci set wireless."$device".disabled='0'
-                  ;;
-              esac
-            fi
+            device="$(uci -q get "wireless.$section.device" 2>/dev/null || true)"
+            [ -n "$device" ] || continue
+
+            band="$(uci -q get "wireless.$device.band" 2>/dev/null || true)"
+            path="$(uci -q get "wireless.$device.path" 2>/dev/null || true)"
+            name="$(uci -q get "wireless.$device.name" 2>/dev/null || true)"
+            radio="$band $path $name $device"
+
+            case "$radio" in
+              *2g*|*2G*|*2.4*|*radio0*)
+                uci set "wireless.$section.ssid=AL-YAHYAWI2.4G"
+                uci set "wireless.$section.disassoc_low_ack=0"
+                uci set "wireless.$section.dtim_period=1"
+                uci set "wireless.$device.disabled=0"
+                uci set "wireless.$device.txpower=33"
+                ;;
+              *5g*|*5G*|*5.0*|*radio1*)
+                uci set "wireless.$section.ssid=AL-YAHYAWI5G"
+                uci set "wireless.$section.disassoc_low_ack=0"
+                uci set "wireless.$section.dtim_period=2"
+                uci set "wireless.$device.disabled=0"
+                uci -q delete "wireless.$device.txpower" || true
+                ;;
+            esac
           done
 
           uci commit wireless
 
-          # This profile is intended for an upstream-managed bridge/AP.
-          # It disables local DHCP/DNS and firewall services.
+          # Branding for the SSH/login banner and system issue.
+          printf '\n%s\n' "$BRAND" >> /etc/banner
+          printf '\n%s\n' "$BRAND" >> /etc/issue
+
+          # Use a dark theme only if the theme exists in this firmware.
+          if [ -d /www/luci-static/dark ]; then
+            uci set luci.main.mediaurlbase='/luci-static/dark'
+            uci set luci.main.title="$BRAND"
+            uci commit luci
+          fi
+
+          # Bridge/AP profile: disable local DHCP, DNS and firewall.
           for service in dnsmasq firewall odhcpd; do
             if [ -x "/etc/init.d/$service" ]; then
               /etc/init.d/"$service" disable || true
@@ -203,40 +212,48 @@ jobs:
             fi
           done
 
-          # Add the brand to the SSH login banner.
-          printf '\n%s\n' "$BRAND" >> /etc/banner
-
           exit 0
           SCRIPT
 
-          chmod 0755 "$ROOT/etc/uci-defaults/99-al-yahyawi"
+          sudo chmod 0755 "$ROOT/etc/uci-defaults/99-al-yahyawi"
 
-          # Replace the Quick Programming description if the file exists.
+          # Replace the Quick Programming text if the expected file exists.
           JS="$ROOT/www/luci-static/resources/view/tecsmart-quicksetup/main.js"
 
           if [ -f "$JS" ]; then
-            python3 - "$JS" <<'PY'
+            sudo python3 - "$JS" <<'PY'
           import sys
           from pathlib import Path
 
           p = Path(sys.argv[1])
           text = p.read_text(encoding="utf-8")
+
           old = "يمكنك استخدام هذه الإضافة الخاصة بميكروتيك يمن لبرمجة الراوتر خلال ثواني فقط"
           new = "يمكنك استخدام هذه الإضافة الخاصة باليحيوي للتجارة ومستلزمات الشبكات لبرمجة الراوتر خلال ثواني فقط"
-          p.write_text(text.replace(old, new), encoding="utf-8")
+
+          if old in text:
+              text = text.replace(old, new)
+              print("Quick Programming text updated.")
+          else:
+              print("Original text not found; file left otherwise unchanged.")
+
+          p.write_text(text, encoding="utf-8")
           PY
+          else
+            echo "Quick Programming JS file not found; skipped."
           fi
 
-          # Rebuild only the root filesystem. Keep the original kernel and
-          # CONTROL files untouched.
-          mksquashfs "$ROOT" "$ROOT_DIR/root.new" \
-            -noappend -comp xz
+          # Rebuild the root filesystem. Keep the original kernel and CONTROL.
+          # -all-root avoids inheriting the GitHub runner's ownership.
+          sudo mksquashfs "$ROOT" "$ROOT_DIR/root.new" \
+            -noappend -comp xz -all-root
 
-          mv "$ROOT_DIR/root.new" "$ROOT_DIR/root"
+          sudo mv "$ROOT_DIR/root.new" "$ROOT_DIR/root"
 
-          echo "Root filesystem customized."
-          sha256sum "$ROOT_DIR/kernel" "$ROOT_DIR/root" \
+          sudo sha256sum "$ROOT_DIR/kernel" "$ROOT_DIR/root" \
             > inspection/rebuilt-component-hashes.txt
+
+          echo "Root filesystem rebuilt."
 
       - name: Repack candidate firmware
         if: steps.layout.outputs.supported == 'true'
@@ -244,35 +261,38 @@ jobs:
         run: |
           set -euo pipefail
 
-          ROOT_DIR="${{ steps.layout.outputs.root_dir }}"
           mkdir -p output
 
-          # Preserve the archive's top-level directory structure.
           tar -cf output/SIMAX1800T-custom-candidate.bin \
             -C work/archive .
 
           file output/SIMAX1800T-custom-candidate.bin \
             | tee inspection/candidate-file-type.txt
+
           sha256sum output/SIMAX1800T-custom-candidate.bin \
             | tee inspection/candidate-sha256.txt
+
+          tar -tf output/SIMAX1800T-custom-candidate.bin \
+            > inspection/candidate-tar-list.txt
 
       - name: Prepare inspection report
         if: always()
         shell: bash
         run: |
+          mkdir -p inspection
+
           {
             echo "# SIMAX1800T firmware inspection"
             echo
-            echo "This workflow does not guarantee that the output is flashable."
-            echo "A rebuild is attempted only when a standard TAR layout is detected."
+            echo "This candidate is NOT validated for flashing."
             echo
-            echo "## File type"
+            echo "## Original file type"
             cat inspection/file-type.txt 2>/dev/null || true
             echo
-            echo "## SHA-256"
+            echo "## Original SHA-256"
             cat inspection/sha256.txt 2>/dev/null || true
             echo
-            echo "## TAR listing"
+            echo "## Original TAR listing"
             cat inspection/tar-list.txt 2>/dev/null || true
             echo
             echo "## Binwalk"
@@ -281,7 +301,10 @@ jobs:
             echo "## Extracted files"
             cat inspection/extracted-files.txt 2>/dev/null || true
             echo
-            echo "## Candidate"
+            echo "## Rebuilt component hashes"
+            cat inspection/rebuilt-component-hashes.txt 2>/dev/null || true
+            echo
+            echo "## Candidate type and hash"
             cat inspection/candidate-file-type.txt 2>/dev/null || true
             cat inspection/candidate-sha256.txt 2>/dev/null || true
           } > inspection/REPORT.md
