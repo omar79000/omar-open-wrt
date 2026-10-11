@@ -1,3 +1,4 @@
+
 name: Build AL-YAHYAWI SIMAX1800T
 
 on:
@@ -55,7 +56,7 @@ jobs:
           test -d rootfs/etc/uci-defaults
           test -d rootfs/dev
 
-          # Branded SSH/login-console banner only.
+          # Branded login banner
           sudo tee rootfs/etc/banner >/dev/null <<'BANNER'
           =======================================================
             اليحيوي للتجارة ومستلزمات الشبكات
@@ -63,64 +64,121 @@ jobs:
           =======================================================
           BANNER
 
-          # First-boot configuration.
+          # First-boot AP configuration
           sudo tee rootfs/etc/uci-defaults/99-vikoomlink-dumb-ap >/dev/null <<'DEFAULTS'
-          # AL-YAHYAWI SIMAX1800T defaults
+          #!/bin/sh
+          # AL-YAHYAWI SIMAX1800T - merged AP defaults
 
+          # Branding
           uci set system.@system[0].hostname='AL-YAHYAWI-OPENWRT'
           uci set system.@system[0].description='اليحيوي للتجارة ومستلزمات الشبكات'
 
-          # 2.4 GHz
+          # Stop and disable services from original AP script
+          for service in firewall dnsmasq log odhcpd; do
+            if [ -x "/etc/init.d/$service" ]; then
+              "/etc/init.d/$service" disable 2>/dev/null || true
+              "/etc/init.d/$service" stop 2>/dev/null || true
+            fi
+          done
+
+          # DHCP configuration
+          uci -q delete dhcp.wan
+          uci -q delete dhcp.lan.ra
+          uci -q delete dhcp.lan.ra_slaac
+          uci -q delete dhcp.lan.ra_flags
+          uci -q delete dhcp.lan.dhcpv6
+          uci set dhcp.lan.ignore='1'
+          uci set dhcp.lan.dynamicdhcp='0'
+          uci set dhcp.lan.dhcpv4='disabled'
+
+          # Network settings from original AP defaults
+          uci -q delete network.wan
+          uci -q delete network.wan6
+          uci -q delete network.lan.ip6assign
+          uci set network.lan.defaultroute='0'
+          uci set network.lan.multipath='off'
+          uci set network.lan.delegate='0'
+          uci -q delete network.globals.ula_prefix
+          uci set network.globals.packet_steering='0'
+
+          LAN_DEV="$(uci -q get network.lan.device)"
+          if [ -n "$LAN_DEV" ]; then
+            uci set network."$LAN_DEV".ipv6='0' 2>/dev/null || true
+          fi
+
+          # Watchcat: retain original section when present
+          if uci -q get watchcat.cfg01e014 >/dev/null 2>&1; then
+            uci -q delete watchcat.cfg01e014.pinghosts
+            uci set watchcat.cfg01e014.mode='periodic_reboot'
+            uci set watchcat.cfg01e014.period='24h'
+          elif [ -x /etc/init.d/watchcat ]; then
+            uci -q delete watchcat.al_yahyawi
+            uci set watchcat.al_yahyawi='watchcat'
+            uci set watchcat.al_yahyawi.mode='periodic_reboot'
+            uci set watchcat.al_yahyawi.period='24h'
+          fi
+
+          # 2.4 GHz: branded settings plus original AP options
+          uci -q delete wireless.radio0.disabled
           uci set wireless.radio0.disabled='0'
+          uci set wireless.radio0.htmode='HT20'
           uci set wireless.radio0.channel='11'
           uci set wireless.radio0.country='PA'
           uci set wireless.radio0.txpower='33'
+          uci set wireless.radio0.cell_density='0'
 
+          uci -q delete wireless.default_radio0.disabled
           uci set wireless.default_radio0.ssid='AL-YAHYAWI2.4G'
+          uci set wireless.default_radio0.isolate='1'
           uci set wireless.default_radio0.beacon_int='50'
           uci set wireless.default_radio0.dtim_period='1'
           uci set wireless.default_radio0.disassoc_low_ack='0'
 
-          # 5 GHz
+          # 5 GHz: branded settings plus original AP options
+          uci -q delete wireless.radio1.disabled
           uci set wireless.radio1.disabled='0'
+          uci set wireless.radio1.htmode='HE40'
           uci set wireless.radio1.channel='36'
           uci set wireless.radio1.country='PA'
           uci -q delete wireless.radio1.txpower
+          uci set wireless.radio1.cell_density='0'
 
+          uci -q delete wireless.default_radio1.disabled
           uci set wireless.default_radio1.ssid='AL-YAHYAWI5G'
+          uci set wireless.default_radio1.isolate='1'
           uci set wireless.default_radio1.beacon_int='100'
           uci set wireless.default_radio1.dtim_period='2'
           uci set wireless.default_radio1.disassoc_low_ack='0'
 
-          uci commit system
-          uci commit wireless
+          # Remove firewall rules and zones as in original script
+          while uci -q delete firewall.@rule[0]; do :; done
+          while uci -q delete firewall.@redirect[0]; do :; done
+          while uci -q delete firewall.@forwarding[0]; do :; done
+          while uci -q delete firewall.@zone[0]; do :; done
+          uci -q delete firewall.@defaults[0].syn_flood
 
-          # Disable services on first boot.
-          for service in dnsmasq firewall odhcpd; do
-            if [ -x "/etc/init.d/$service" ]; then
-              "/etc/init.d/$service" stop || true
-              "/etc/init.d/$service" disable || true
-            fi
-          done
-
-          # Configure a 24-hour periodic Watchcat reboot,
-          # only when Watchcat is installed.
-          if [ -x /etc/init.d/watchcat ]; then
-            uci -q delete watchcat.al_yahyawi
-            uci set watchcat.al_yahyawi='watchcat'
-            uci set watchcat.al_yahyawi.mode='periodic'
-            uci set watchcat.al_yahyawi.period='24h'
-            uci commit watchcat
-            /etc/init.d/watchcat enable || true
+          # LuCI model name branding
+          if [ -f /www/luci-static/resources/view/status/include/10_system.js ]; then
+            sed -i "s/boardinfo\.model/'AL-YAHYAWI-OPENWRT '/g" \
+              /www/luci-static/resources/view/status/include/10_system.js
           fi
 
+          # Commit settings
+          uci commit system
+          uci commit dhcp
+          uci commit network
+          uci commit wireless
+          uci commit firewall
+          uci commit watchcat 2>/dev/null
+
+          echo "AL-YAHYAWI SIMAX1800T AP defaults applied."
           exit 0
           DEFAULTS
 
           sudo chmod 755 \
             rootfs/etc/uci-defaults/99-vikoomlink-dumb-ap
 
-          # Change only the requested Quick Setup text.
+          # Update Quick Setup description
           sudo python3 - <<'PY'
           from pathlib import Path
 
@@ -153,7 +211,7 @@ jobs:
           print("Quick Setup text patched.")
           PY
 
-          # Preserve extracted file ownership; do NOT use -all-root.
+          # Rebuild SquashFS
           sudo mksquashfs rootfs "$FW_DIR/root.new" \
             -comp xz \
             -b 262144 \
@@ -162,7 +220,7 @@ jobs:
 
           sudo mv "$FW_DIR/root.new" "$FW_DIR/root"
 
-          # Verify the rebuilt SquashFS and essential device node.
+          # Validate SquashFS and console node
           sudo unsquashfs -s "$FW_DIR/root"
 
           sudo unsquashfs -ll "$FW_DIR/root" \
@@ -180,7 +238,7 @@ jobs:
             -cf output/SIMAX1800T-AL-YAHYAWI-sysupgrade.bin \
             -C work sysupgrade-sim_simax1800t
 
-          # Verify the archive contains the required components.
+          # Verify required archive components
           tar -tf output/SIMAX1800T-AL-YAHYAWI-sysupgrade.bin \
             | tee output/archive-list.txt
 
@@ -196,10 +254,10 @@ jobs:
             'sysupgrade-sim_simax1800t/root' \
             output/archive-list.txt
 
-          # Verify kernel and CONTROL remain unchanged.
+          # Kernel and CONTROL must remain unchanged
           sha256sum -c original-components.sha256
 
-          # Verify the packaged root is the rebuilt SquashFS.
+          # Verify packaged root filesystem
           tar -xOf \
             output/SIMAX1800T-AL-YAHYAWI-sysupgrade.bin \
             sysupgrade-sim_simax1800t/root \
